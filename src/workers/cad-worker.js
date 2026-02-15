@@ -33,7 +33,8 @@ const checkSymbols = (stagename) => {
     const symbols = {
         gp_Pnt: !!findAnywhere(occt, 'gp_Pnt'),
         BRepPrimAPI_MakeBox: !!findAnywhere(occt, 'BRepPrimAPI_MakeBox'),
-        TopoDS_Shape: !!findAnywhere(occt, 'TopoDS_Shape')
+        TopoDS_Shape: !!findAnywhere(occt, 'TopoDS_Shape'),
+        BRepAlgoAPI_Cut: !!findAnywhere(occt, 'BRepAlgoAPI_Cut')
     };
     console.log(`OCCT Symbols [${stagename}]:`, symbols);
     return symbols;
@@ -119,12 +120,14 @@ self.onmessage = async (event) => {
             case 'MAKE_CONE':
                 result = makeCone(payload);
                 break;
+            case 'BOOLEAN_OP':
+                result = executeBooleanOp(payload);
+                break;
             default:
                 throw new Error(`Unknown action: ${action}`);
         }
 
         // Send back successful result
-        // Note: For large geometry data, consider using Transferables for performance
         self.postMessage({ id, status: 'success', result });
 
     } catch (error) {
@@ -132,6 +135,88 @@ self.onmessage = async (event) => {
         self.postMessage({ id, status: 'error', error: error.message });
     }
 };
+
+/**
+ * Executes a Boolean operation between two shapes.
+ */
+function executeBooleanOp({ type, base, tool }) {
+    console.log(`CAD Worker: Executing Boolean Operation [${type}]`);
+    let baseRaw, toolRaw, transformedTool, boolOp, finalShape;
+
+    try {
+        // 1. Generate Base Shape
+        baseRaw = createShapeFromConfig(base);
+        if (baseRaw.error) throw new Error(`Base Shape creation failed: ${baseRaw.error}`);
+
+        // 2. Generate Tool Shape
+        toolRaw = createShapeFromConfig(tool);
+        if (toolRaw.error) throw new Error(`Tool Shape creation failed: ${toolRaw.error}`);
+
+        // 3. Apply Transform to Tool Shape
+        transformedTool = applyTransform(toolRaw.shape, tool.transform || { x: 0, y: 0, z: 0 });
+
+        // 4. Extract Tool Mesh for preview
+        const toolMeshData = getMeshData(transformedTool);
+
+        // 5. Perform Boolean Operation
+        switch (type) {
+            case 'FUSE':
+                boolOp = new occt.BRepAlgoAPI_Fuse_3(baseRaw.shape, transformedTool);
+                break;
+            case 'CUT':
+                boolOp = new occt.BRepAlgoAPI_Cut_3(baseRaw.shape, transformedTool);
+                break;
+            case 'COMMON':
+                boolOp = new occt.BRepAlgoAPI_Common_3(baseRaw.shape, transformedTool);
+                break;
+            default:
+                throw new Error(`Unsupported Boolean operation: ${type}`);
+        }
+
+        boolOp.Build();
+        if (!boolOp.IsDone()) throw new Error("Boolean operation failed in OCCT");
+
+        finalShape = boolOp.Shape();
+        const resultMeshData = getMeshData(finalShape);
+
+        return {
+            created: true,
+            type: `boolean_${type.toLowerCase()}`,
+            positions: resultMeshData.positions,
+            normals: resultMeshData.normals,
+            // Include tool mesh for "ghost" preview
+            toolMesh: {
+                positions: toolMeshData.positions,
+                normals: toolMeshData.normals
+            }
+        };
+
+    } catch (err) {
+        console.error("CAD Worker: executeBooleanOp failed", err);
+        return { error: err.toString() };
+    } finally {
+        // Careful cleanup
+        if (baseRaw) { baseRaw.shape.delete(); baseRaw.maker.delete(); }
+        if (toolRaw) { toolRaw.shape.delete(); toolRaw.maker.delete(); }
+        if (transformedTool) transformedTool.delete();
+        if (boolOp) boolOp.delete();
+        if (finalShape) finalShape.delete();
+    }
+}
+
+/**
+ * Helper to create a raw TopoDS_Shape from a configuration object.
+ */
+function createShapeFromConfig(config) {
+    const { type, params } = config;
+    switch (type) {
+        case 'box': return makeBox(params, true);
+        case 'cylinder': return makeCylinder(params, true);
+        case 'sphere': return makeSphere(params, true);
+        case 'cone': return makeCone(params, true);
+        default: return { error: `Unsupported shape type: ${type}` };
+    }
+}
 
 // --- Geometry Functions ---
 
@@ -207,44 +292,32 @@ function getMeshData(shape) {
 }
 
 
-function makeBox({ width, height, depth }) {
-    // The `loaded` check is already done in the onmessage handler, so no need to duplicate here.
-
+function makeBox({ width, height, depth }, returnRawShape = false) {
     console.log(`CAD Worker: Creating box with dims: ${width}, ${height}, ${depth}`);
-
     try {
-        // In OCCT 2.0-beta, overloaded constructors are often exported with suffix _N
-        // BRepPrimAPI_MakeBox_2(dx, dy, dz) is the 3-parameter constructor.
         const Ctor = findAnywhere(occt, 'BRepPrimAPI_MakeBox_2') || findAnywhere(occt, 'BRepPrimAPI_MakeBox');
-
-        if (!Ctor) {
-            throw new Error("Could not find BRepPrimAPI_MakeBox constructor");
-        }
+        if (!Ctor) throw new Error("Could not find BRepPrimAPI_MakeBox constructor");
 
         const mkBox = new Ctor(width, height, depth);
         const shape = mkBox.Shape();
 
-        // Use helper to generate mesh data (handles triangulation and extraction)
-        const meshData = getMeshData(shape);
+        if (returnRawShape) {
+            // Keep shape and constructor alive, caller must cleanup
+            return { shape, maker: mkBox };
+        }
 
-        // Cleanup
+        const meshData = getMeshData(shape);
         shape.delete();
         mkBox.delete();
 
-        return {
-            created: true,
-            type: 'box',
-            dims: [width, height, depth],
-            positions: meshData.positions,
-            normals: meshData.normals
-        };
+        return { created: true, type: 'box', dims: [width, height, depth], positions: meshData.positions, normals: meshData.normals };
     } catch (err) {
         console.error("CAD Worker: makeBox failed", err);
         return { error: err.toString() };
     }
 }
 
-function makeCylinder({ radius, height }) {
+function makeCylinder({ radius, height }, returnRawShape = false) {
     console.log(`CAD Worker: Creating cylinder with r=${radius}, h=${height}`);
     try {
         const Ctor = findAnywhere(occt, 'BRepPrimAPI_MakeCylinder_1') || findAnywhere(occt, 'BRepPrimAPI_MakeCylinder');
@@ -252,6 +325,9 @@ function makeCylinder({ radius, height }) {
 
         const mkCyl = new Ctor(radius, height);
         const shape = mkCyl.Shape();
+
+        if (returnRawShape) return { shape, maker: mkCyl };
+
         const meshData = getMeshData(shape);
         shape.delete();
         mkCyl.delete();
@@ -263,7 +339,7 @@ function makeCylinder({ radius, height }) {
     }
 }
 
-function makeSphere({ radius }) {
+function makeSphere({ radius }, returnRawShape = false) {
     console.log(`CAD Worker: Creating sphere with r=${radius}`);
     try {
         const Ctor = findAnywhere(occt, 'BRepPrimAPI_MakeSphere_1') || findAnywhere(occt, 'BRepPrimAPI_MakeSphere');
@@ -271,6 +347,9 @@ function makeSphere({ radius }) {
 
         const mkSphere = new Ctor(radius);
         const shape = mkSphere.Shape();
+
+        if (returnRawShape) return { shape, maker: mkSphere };
+
         const meshData = getMeshData(shape);
         shape.delete();
         mkSphere.delete();
@@ -282,7 +361,7 @@ function makeSphere({ radius }) {
     }
 }
 
-function makeCone({ radius1, radius2, height }) {
+function makeCone({ radius1, radius2, height }, returnRawShape = false) {
     console.log(`CAD Worker: Creating cone with r1=${radius1}, r2=${radius2}, h=${height}`);
     try {
         const Ctor = findAnywhere(occt, 'BRepPrimAPI_MakeCone_1') || findAnywhere(occt, 'BRepPrimAPI_MakeCone');
@@ -290,6 +369,9 @@ function makeCone({ radius1, radius2, height }) {
 
         const mkCone = new Ctor(radius1, radius2, height);
         const shape = mkCone.Shape();
+
+        if (returnRawShape) return { shape, maker: mkCone };
+
         const meshData = getMeshData(shape);
         shape.delete();
         mkCone.delete();
@@ -299,4 +381,21 @@ function makeCone({ radius1, radius2, height }) {
         console.error("CAD Worker: makeCone failed", err);
         return { error: err.toString() };
     }
+}
+
+/**
+ * Applies translation to a shape.
+ */
+function applyTransform(shape, { x, y, z }) {
+    const trsf = new occt.gp_Trsf_1();
+    const vec = new occt.gp_Vec_4(x || 0, y || 0, z || 0);
+    trsf.SetTranslation_1(vec);
+    const loc = new occt.TopLoc_Location_2(trsf);
+    const transformedShape = shape.Moved(loc);
+
+    trsf.delete();
+    vec.delete();
+    loc.delete();
+
+    return transformedShape; // Caller manages this
 }
