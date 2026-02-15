@@ -40,6 +40,12 @@ const checkSymbols = (stagename) => {
         BRepAlgoAPI_Cut: !!findAnywhere(occt, 'BRepAlgoAPI_Cut')
     };
     console.log(`OCCT Symbols [${stagename}]:`, symbols);
+
+    // Debug: Log all ShapeUpgrade* or *Unify* classes
+    if (stagename === 'Final') {
+        const props = Object.keys(occt).filter(k => k.includes('ShapeUpgrade') || k.includes('Unify'));
+        console.log("Found ShapeUpgrade/Unify classes:", props);
+    }
     return symbols;
 };
 
@@ -380,15 +386,103 @@ function applyBooleanOperator(baseShape, toolShape, operator) {
                 return { error: `Unknown operator: ${operator}` };
         }
 
+        if (boolOp.SetSimplifyResult) {
+            boolOp.SetSimplifyResult(true);
+        }
+
         boolOp.Build();
         if (!boolOp.IsDone()) throw new Error(`Boolean ${operator} failed`);
 
+        const rawShape = boolOp.Shape();
+
+        // Simplify the result (merge coplanar faces) using UnifySameDomain
+        // This is crucial for clean fusing of coplanar shapes
+        const simplified = simplifyShape(rawShape);
+
+        if (simplified !== rawShape) {
+            rawShape.delete();
+        }
+
         return {
-            shape: boolOp.Shape(),
+            shape: simplified,
             maker: boolOp
         };
     } catch (err) {
         return { error: err.message };
+    }
+}
+
+/**
+ * Tries to simplify the shape by unifying same-domain faces.
+ * Explicitly tries different constructor bindings that exist in the WASM module.
+ */
+function simplifyShape(shape) {
+    let unifier = null;
+
+    // Strategy 1: Try 4-argument constructor (UnifySameDomain_2)
+    // C++: UnifySameDomain(shape, unifyEdges, unifyFaces, concatBSplines)
+    const Unifier2 = findAnywhere(occt, 'ShapeUpgrade_UnifySameDomain_2');
+    if (Unifier2) {
+        try {
+            unifier = new Unifier2(shape, true, true, false);
+        } catch (e) {
+            // console.warn("ShapeUpgrade_UnifySameDomain_2 constructor failed", e);
+        }
+    }
+
+    // Strategy 2: Try 1-argument constructor (UnifySameDomain_1)
+    // C++: UnifySameDomain(shape)
+    if (!unifier) {
+        const Unifier1 = findAnywhere(occt, 'ShapeUpgrade_UnifySameDomain_1');
+        if (Unifier1) {
+            try {
+                unifier = new Unifier1(shape);
+            } catch (e) {
+                // console.warn("ShapeUpgrade_UnifySameDomain_1 constructor failed", e);
+            }
+        }
+    }
+
+    if (unifier) {
+        try {
+            unifier.Build();
+            const newShape = unifier.Shape();
+            unifier.delete();
+            return newShape;
+        } catch (e) {
+            console.warn("UnifySameDomain Build/Shape failed:", e);
+            unifier.delete();
+        }
+    }
+
+    // Fallback: If Unify fails, try RemoveInternalWires
+    return tryRemoveInternalWires(shape);
+}
+
+/**
+ * Tries to remove internal wires using ShapeUpgrade_RemoveInternalWires.
+ * This is a fallback since ShapeUpgrade_UnifySameDomain constructor is not accessible.
+ */
+function tryRemoveInternalWires(shape) {
+    try {
+        const Remover = findAnywhere(occt, 'ShapeUpgrade_RemoveInternalWires');
+        if (!Remover) return shape;
+
+        // Constructor: (shape)
+        const tool = new Remover(shape);
+        tool.Perform();
+
+        if (tool.Status(occt.ShapeExtend_Status.ShapeExtend_DONE)) {
+            const result = tool.GetResult();
+            tool.delete();
+            return result;
+        }
+
+        tool.delete();
+        return shape;
+    } catch (e) {
+        // console.warn("RemoveInternalWires failed:", e);
+        return shape;
     }
 }
 
@@ -484,6 +578,7 @@ function createShapeFromConfig(config) {
 function getMeshData(shape) {
     const positions = [];
     const normals = [];
+    const faceIds = []; // Track IDs for each vertex for face picking
 
     // 1. Calculate optimal deflection based on size (Dynamic LOD)
     const bbox = new occt.Bnd_Box_1();
@@ -513,7 +608,7 @@ function getMeshData(shape) {
     bbox.delete();
 
     const explorer = new occt.TopExp_Explorer_2(shape, occt.TopAbs_ShapeEnum.TopAbs_FACE, occt.TopAbs_ShapeEnum.TopAbs_SHAPE);
-    let count = 0;
+    let faceCounter = 0;
     while (explorer.More()) {
         const face = occt.TopoDS.Face_1(explorer.Current());
         const loc = new occt.TopLoc_Location_1();
@@ -523,6 +618,8 @@ function getMeshData(shape) {
             const tr = triangulation.get();
             const nodes = tr.Nodes();
             const triangles = tr.Triangles();
+            // Assign a unique ID to this face
+            const faceId = faceCounter;
 
             for (let i = 1; i <= tr.NbTriangles(); i++) {
                 const tri = triangles.Value(i);
@@ -537,6 +634,9 @@ function getMeshData(shape) {
                 positions.push(p1.X(), p1.Y(), p1.Z());
                 positions.push(p2.X(), p2.Y(), p2.Z());
                 positions.push(p3.X(), p3.Y(), p3.Z());
+
+                // Face IDs for picking (1 float per vertex)
+                faceIds.push(faceId, faceId, faceId);
 
                 // Calculate normal
                 const v1 = new occt.gp_Vec_5(p1, p2);
@@ -559,16 +659,18 @@ function getMeshData(shape) {
         }
         loc.delete();
         explorer.Next();
-        count++;
+        faceCounter++;
     }
     explorer.delete();
-    console.log(`Mesh data extracted: ${positions.length / 3} vertices from ${count} faces.`);
+    console.log(`Mesh data extracted: ${positions.length / 3} vertices from ${faceCounter} faces.`);
     // Note: p1, p2, p3, vec1, vec2, n, face, loc, triangulation, tr, nodes, triangles, transformation are temporary and will be garbage collected by JS.
     // OCCT objects created with `new` need explicit `.delete()` if not managed by smart pointers or returned.
 
     return {
         positions: new Float32Array(positions),
-        normals: new Float32Array(normals)
+        normals: new Float32Array(normals),
+        faceIds: new Float32Array(faceIds),
+        faceCount: faceCounter
     };
 }
 
@@ -591,7 +693,7 @@ function makeBox({ width, height, depth }, returnRawShape = false) {
         shape.delete();
         mkBox.delete();
 
-        return { created: true, type: 'box', dims: [width, height, depth], positions: meshData.positions, normals: meshData.normals };
+        return { created: true, type: 'box', dims: [width, height, depth], ...meshData };
     } catch (err) {
         console.error("CAD Worker: makeBox failed", err);
         return { error: err.toString() };
@@ -613,7 +715,7 @@ function makeCylinder({ radius, height }, returnRawShape = false) {
         shape.delete();
         mkCyl.delete();
 
-        return { created: true, type: 'cylinder', dims: [radius, height], positions: meshData.positions, normals: meshData.normals };
+        return { created: true, type: 'cylinder', dims: [radius, height], ...meshData };
     } catch (err) {
         console.error("CAD Worker: makeCylinder failed", err);
         return { error: err.toString() };
@@ -635,7 +737,7 @@ function makeSphere({ radius }, returnRawShape = false) {
         shape.delete();
         mkSphere.delete();
 
-        return { created: true, type: 'sphere', dims: [radius], positions: meshData.positions, normals: meshData.normals };
+        return { created: true, type: 'sphere', dims: [radius], ...meshData };
     } catch (err) {
         console.error("CAD Worker: makeSphere failed", err);
         return { error: err.toString() };
@@ -657,7 +759,7 @@ function makeCone({ radius1, radius2, height }, returnRawShape = false) {
         shape.delete();
         mkCone.delete();
 
-        return { created: true, type: 'cone', dims: [radius1, radius2, height], positions: meshData.positions, normals: meshData.normals };
+        return { created: true, type: 'cone', dims: [radius1, radius2, height], ...meshData };
     } catch (err) {
         console.error("CAD Worker: makeCone failed", err);
         return { error: err.toString() };

@@ -10,9 +10,16 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const sceneRef = useRef<THREE.Scene | null>(null);
     const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+    const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
     const meshRef = useRef<THREE.Mesh | null>(null);
     const edgesRef = useRef<THREE.LineSegments | null>(null);
     const toolMeshRef = useRef<THREE.Mesh | null>(null);
+
+    // Raycasting & Picking Refs
+    const raycasterRef = useRef(new THREE.Raycaster());
+    const mouseRef = useRef(new THREE.Vector2(-1, -1));
+    const materialShaderRef = useRef<any>(null);
+    const needsRaycastRef = useRef(false);
 
     useEffect(() => {
         if (!containerRef.current) return;
@@ -31,6 +38,7 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
         );
         camera.position.set(60, 60, 60);
         camera.lookAt(0, 0, 0);
+        cameraRef.current = camera;
 
         // Initialize Renderer
         const renderer = new THREE.WebGLRenderer({
@@ -69,10 +77,46 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
         gridHelper.position.y = -0.02; // Small offset to prevent Z-fighting with Z=0 faces
         scene.add(gridHelper);
 
+        // Interaction Handler
+        const onPointerMove = (event: PointerEvent) => {
+            if (!containerRef.current) return;
+            const rect = containerRef.current.getBoundingClientRect();
+            mouseRef.current.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouseRef.current.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            needsRaycastRef.current = true;
+        };
+        containerRef.current.addEventListener('pointermove', onPointerMove);
+
         // Animation Loop
         const animate = () => {
             const req = requestAnimationFrame(animate);
             controls.update();
+
+            // Raycasting logic
+            if (needsRaycastRef.current && meshRef.current && cameraRef.current) {
+                raycasterRef.current.setFromCamera(mouseRef.current, cameraRef.current);
+                const intersects = raycasterRef.current.intersectObject(meshRef.current);
+
+                let hoveredFaceId = -1.0;
+                if (intersects.length > 0) {
+                    const intersected = intersects[0];
+                    const faceIndex = intersected.faceIndex;
+                    if (faceIndex !== undefined) {
+                        // BufferGeometry stores triangles sequentially (3 vertices per triangle)
+                        // Read the aFaceId attribute from the first vertex of the triangle
+                        const attribute = meshRef.current.geometry.getAttribute('aFaceId');
+                        if (attribute) {
+                            hoveredFaceId = attribute.getX(faceIndex * 3);
+                        }
+                    }
+                }
+
+                if (materialShaderRef.current) {
+                    materialShaderRef.current.uniforms.uHoverFaceId.value = hoveredFaceId;
+                }
+                needsRaycastRef.current = false;
+            }
+
             renderer.render(scene, camera);
         };
         const animId = requestAnimationFrame(animate);
@@ -87,6 +131,9 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
 
         return () => {
             window.removeEventListener('resize', handleResize);
+            if (containerRef.current) {
+                containerRef.current.removeEventListener('pointermove', onPointerMove);
+            }
             cancelAnimationFrame(animId);
             if (containerRef.current && renderer.domElement) {
                 containerRef.current.removeChild(renderer.domElement);
@@ -104,6 +151,7 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
             meshRef.current.geometry.dispose();
             (meshRef.current.material as THREE.Material).dispose();
             meshRef.current = null;
+            materialShaderRef.current = null;
         }
         if (edgesRef.current) {
             sceneRef.current.remove(edgesRef.current);
@@ -129,25 +177,54 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
                 threeGeo.computeVertexNormals();
             }
 
+            // Face Picking Attribute
+            if (geometry.finalMesh.faceIds) {
+                threeGeo.setAttribute('aFaceId', new THREE.Float32BufferAttribute(geometry.finalMesh.faceIds, 1));
+            }
+
             const material = new THREE.MeshPhongMaterial({
                 color: 0x3b82f6,
                 specular: 0x444444,
                 shininess: 80,
-                side: THREE.DoubleSide, // Reverted to DoubleSide for robust CAD rendering
+                side: THREE.DoubleSide,
                 flatShading: false,
                 transparent: !!geometry.activeMesh,
                 opacity: geometry.activeMesh ? 0.3 : 1.0,
                 depthWrite: !geometry.activeMesh,
                 polygonOffset: true,
-                polygonOffsetFactor: 1, // Lowered offset
+                polygonOffsetFactor: 1,
                 polygonOffsetUnits: 1
             });
+
+            // Inject Custom Shader Logic
+            material.onBeforeCompile = (shader) => {
+                shader.uniforms.uHoverFaceId = { value: -1.0 };
+
+                // Vertex Shader: pass aFaceId to Fragment Shader
+                shader.vertexShader = 'attribute float aFaceId;\nvarying float vFaceId;\n' + shader.vertexShader;
+                shader.vertexShader = shader.vertexShader.replace(
+                    '#include <begin_vertex>',
+                    '#include <begin_vertex>\nvFaceId = aFaceId;'
+                );
+
+                // Fragment Shader: highlight face if it matches uHoverFaceId
+                shader.fragmentShader = 'uniform float uHoverFaceId;\nvarying float vFaceId;\n' + shader.fragmentShader;
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <dithering_fragment>',
+                    '#include <dithering_fragment>\n' +
+                    'if (uHoverFaceId >= 0.0 && abs(vFaceId - uHoverFaceId) < 0.1) {\n' +
+                    '    gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(1.0, 0.8, 0.0), 0.5);\n' +
+                    '}'
+                );
+
+                materialShaderRef.current = shader;
+            };
 
             const mesh = new THREE.Mesh(threeGeo, material);
             sceneRef.current.add(mesh);
             meshRef.current = mesh;
 
-            // Add Edges/Wireframe highlight
+            // Add Edges/Wireframe
             const edgesGeo = new THREE.EdgesGeometry(threeGeo, 20);
             const edgesMat = new THREE.LineBasicMaterial({
                 color: 0xffffff,
@@ -157,7 +234,6 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
                 depthWrite: false
             });
             const edges = new THREE.LineSegments(edgesGeo, edgesMat);
-            // Push edges slightly out to prevent face occlusion
             edges.scale.setScalar(1.001);
             sceneRef.current.add(edges);
             edgesRef.current = edges;
@@ -180,19 +256,18 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
                 color: 0xff007f, // Bright Pink
                 specular: 0xffffff,
                 shininess: 100,
-                side: THREE.DoubleSide, // Must be DoubleSide
+                side: THREE.DoubleSide,
                 transparent: true,
                 opacity: 0.7,
                 polygonOffset: true,
-                polygonOffsetFactor: -1, // Balanced offset
+                polygonOffsetFactor: -1,
                 polygonOffsetUnits: -1,
                 depthWrite: true,
                 depthTest: true
             });
 
             const activeMesh = new THREE.Mesh(activeGeo, activeMaterial);
-            // Slightly scale active mesh if it is a perfect overlap
-            activeMesh.scale.setScalar(1.0002); // Lower scaling
+            activeMesh.scale.setScalar(1.0002);
             sceneRef.current.add(activeMesh);
             toolMeshRef.current = activeMesh;
         }

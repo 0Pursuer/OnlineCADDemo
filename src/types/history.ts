@@ -35,6 +35,8 @@ export interface ShapeReference {
 export interface MeshData {
     positions: Float32Array | number[];
     normals: Float32Array | number[];
+    faceIds?: Float32Array | number[]; // Optional face IDs for picking
+    faceCount?: number;
 }
 
 /**
