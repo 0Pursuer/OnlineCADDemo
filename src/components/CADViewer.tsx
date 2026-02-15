@@ -33,7 +33,11 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
         camera.lookAt(0, 0, 0);
 
         // Initialize Renderer
-        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            alpha: true,
+            logarithmicDepthBuffer: true // Better depth precision for close surfaces
+        });
         renderer.setPixelRatio(window.devicePixelRatio);
         renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight);
         containerRef.current.appendChild(renderer.domElement);
@@ -62,6 +66,7 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
 
         // Add Grid
         const gridHelper = new THREE.GridHelper(100, 50, 0x333333, 0x222222);
+        gridHelper.position.y = -0.02; // Small offset to prevent Z-fighting with Z=0 faces
         scene.add(gridHelper);
 
         // Animation Loop
@@ -113,13 +118,13 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
             toolMeshRef.current = null;
         }
 
-        // 1. Render Main Geometry
-        if (geometry.positions && geometry.positions.length > 0) {
+        // 1. Render Main Geometry (Result)
+        if (geometry.finalMesh && geometry.finalMesh.positions && geometry.finalMesh.positions.length > 0) {
             const threeGeo = new THREE.BufferGeometry();
-            threeGeo.setAttribute('position', new THREE.Float32BufferAttribute(geometry.positions, 3));
+            threeGeo.setAttribute('position', new THREE.Float32BufferAttribute(geometry.finalMesh.positions, 3));
 
-            if (geometry.normals && geometry.normals.length > 0) {
-                threeGeo.setAttribute('normal', new THREE.Float32BufferAttribute(geometry.normals, 3));
+            if (geometry.finalMesh.normals && geometry.finalMesh.normals.length > 0) {
+                threeGeo.setAttribute('normal', new THREE.Float32BufferAttribute(geometry.finalMesh.normals, 3));
             } else {
                 threeGeo.computeVertexNormals();
             }
@@ -128,8 +133,14 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
                 color: 0x3b82f6,
                 specular: 0x444444,
                 shininess: 80,
-                side: THREE.DoubleSide,
-                flatShading: false
+                side: THREE.DoubleSide, // Reverted to DoubleSide for robust CAD rendering
+                flatShading: false,
+                transparent: !!geometry.activeMesh,
+                opacity: geometry.activeMesh ? 0.3 : 1.0,
+                depthWrite: !geometry.activeMesh,
+                polygonOffset: true,
+                polygonOffsetFactor: 1, // Lowered offset
+                polygonOffsetUnits: 1
             });
 
             const mesh = new THREE.Mesh(threeGeo, material);
@@ -137,37 +148,53 @@ const CADViewer: React.FC<CADViewerProps> = ({ geometry }) => {
             meshRef.current = mesh;
 
             // Add Edges/Wireframe highlight
-            const edgesGeo = new THREE.EdgesGeometry(threeGeo, 20); // 20 deg threshold
-            const edgesMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2, transparent: true, opacity: 0.6 });
+            const edgesGeo = new THREE.EdgesGeometry(threeGeo, 20);
+            const edgesMat = new THREE.LineBasicMaterial({
+                color: 0xffffff,
+                linewidth: 2,
+                transparent: true,
+                opacity: geometry.activeMesh ? 0.1 : 0.6,
+                depthWrite: false
+            });
             const edges = new THREE.LineSegments(edgesGeo, edgesMat);
+            // Push edges slightly out to prevent face occlusion
+            edges.scale.setScalar(1.001);
             sceneRef.current.add(edges);
             edgesRef.current = edges;
 
             threeGeo.computeBoundingSphere();
         }
 
-        // 2. Render Tool Mesh (Ghost Preview - Fainter now)
-        if (geometry.toolMesh && geometry.toolMesh.positions && geometry.toolMesh.positions.length > 0) {
-            const toolGeo = new THREE.BufferGeometry();
-            toolGeo.setAttribute('position', new THREE.Float32BufferAttribute(geometry.toolMesh.positions, 3));
+        // 2. Render Active Mesh (Pink Highlight Preview)
+        if (geometry.activeMesh && geometry.activeMesh.positions && geometry.activeMesh.positions.length > 0) {
+            const activeGeo = new THREE.BufferGeometry();
+            activeGeo.setAttribute('position', new THREE.Float32BufferAttribute(geometry.activeMesh.positions, 3));
 
-            if (geometry.toolMesh.normals && geometry.toolMesh.normals.length > 0) {
-                toolGeo.setAttribute('normal', new THREE.Float32BufferAttribute(geometry.toolMesh.normals, 3));
+            if (geometry.activeMesh.normals && geometry.activeMesh.normals.length > 0) {
+                activeGeo.setAttribute('normal', new THREE.Float32BufferAttribute(geometry.activeMesh.normals, 3));
             } else {
-                toolGeo.computeVertexNormals();
+                activeGeo.computeVertexNormals();
             }
 
-            const toolMaterial = new THREE.MeshPhongMaterial({
-                color: 0xa855f7,
+            const activeMaterial = new THREE.MeshPhongMaterial({
+                color: 0xff007f, // Bright Pink
+                specular: 0xffffff,
+                shininess: 100,
+                side: THREE.DoubleSide, // Must be DoubleSide
                 transparent: true,
-                opacity: 0.15,    // Much fainter as requested
-                side: THREE.DoubleSide,
-                depthWrite: false
+                opacity: 0.7,
+                polygonOffset: true,
+                polygonOffsetFactor: -1, // Balanced offset
+                polygonOffsetUnits: -1,
+                depthWrite: true,
+                depthTest: true
             });
 
-            const toolMesh = new THREE.Mesh(toolGeo, toolMaterial);
-            sceneRef.current.add(toolMesh);
-            toolMeshRef.current = toolMesh;
+            const activeMesh = new THREE.Mesh(activeGeo, activeMaterial);
+            // Slightly scale active mesh if it is a perfect overlap
+            activeMesh.scale.setScalar(1.0002); // Lower scaling
+            sceneRef.current.add(activeMesh);
+            toolMeshRef.current = activeMesh;
         }
     }, [geometry]);
 

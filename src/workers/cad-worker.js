@@ -13,6 +13,9 @@ import {
 let occt = null;
 let loaded = false;
 
+// Global Shape Cache (nodeId -> { shape, maker })
+const shapeCache = new Map();
+
 const findAnywhere = (obj, name, visited = new Set()) => {
     if (!obj || visited.has(obj)) return null;
     visited.add(obj);
@@ -123,18 +126,237 @@ self.onmessage = async (event) => {
             case 'BOOLEAN_OP':
                 result = executeBooleanOp(payload);
                 break;
+            case 'RECOMPUTE':
+                result = await recomputeHistory(payload);
+                break;
             default:
                 throw new Error(`Unknown action: ${action}`);
         }
 
-        // Send back successful result
-        self.postMessage({ id, status: 'success', result });
+        // Collect all ArrayBuffers for zero-copy transfer
+        const transferList = getTransferables(result);
+
+        // Send back successful result with shared ownership transfer
+        self.postMessage({ id, status: 'success', result }, transferList);
 
     } catch (error) {
         console.error(`CAD Worker Error [${action}]:`, error);
         self.postMessage({ id, status: 'error', error: error.message });
     }
 };
+
+/**
+ * Recursively find all Transferable objects (ArrayBuffers) in a result object.
+ */
+function getTransferables(obj) {
+    const transferables = [];
+    if (!obj) return transferables;
+
+    function search(item) {
+        if (!item) return;
+        if (item instanceof ArrayBuffer) {
+            transferables.push(item);
+        } else if (ArrayBuffer.isView(item)) {
+            // e.g., Float32Array, Int32Array
+            transferables.push(item.buffer);
+        } else if (typeof item === 'object') {
+            for (const key in item) {
+                // Avoid infinite recursion or circular refs if any
+                if (Object.prototype.hasOwnProperty.call(item, key)) {
+                    search(item[key]);
+                }
+            }
+        }
+    }
+    search(obj);
+    return transferables;
+}
+
+/**
+ * Recomputes the entire modeling history.
+ * @param {Array} history Array of HistoryNode objects.
+ */
+/**
+ * Recomputes the entire modeling history using a linear stack model.
+ */
+async function recomputeHistory({ history, activeNodeId, isEditing }) {
+    console.log(`CAD Worker: Recomputing linear stack (${history.length} nodes)`);
+
+    // 1. Cleanup orphaned cache entries
+    const historyIds = new Set(history.map(n => n.id));
+    for (const [id, data] of shapeCache.entries()) {
+        if (!historyIds.has(id)) {
+            data.shape.delete();
+            if (data.maker) data.maker.delete();
+            shapeCache.delete(id);
+        }
+    }
+
+    let currentResult = null;
+    let currentIsTemp = false; // Track if currentResult can be safely deleted
+    let activeShape = null;
+    let needsCascade = false;
+
+    // 2. Process stack
+    for (let i = 0; i < history.length; i++) {
+        const node = history[i];
+        const isDirty = node.dirty || (activeNodeId && node.id === activeNodeId && isEditing);
+
+        // If THIS node or any PREVIOUS node is dirty, we can't use the cache for the accumulation
+        if (!isDirty && !needsCascade && shapeCache.has(node.id)) {
+            const cached = shapeCache.get(node.id);
+            currentResult = cached.shape;
+            currentIsTemp = false; // It's owned by the cache
+            console.log(`Using cache for node ${node.id}`);
+
+            // If we are editing this node, we still need its raw shape for preview
+            if (node.id === activeNodeId && isEditing) {
+                const shapeData = await executeNode(node);
+                activeShape = shapeData.shape;
+            }
+            continue;
+        }
+
+        // We are recomputing this step or cascading
+        needsCascade = true;
+        console.log(`Recomputing node ${node.id} (Dirty: ${isDirty}, Cascade: ${needsCascade})`);
+
+        // 1. Generate the primitive for THIS node
+        const shapeData = await executeNode(node);
+        if (shapeData.error) throw new Error(shapeData.error);
+        const primitive = shapeData.shape;
+
+        if (node.id === activeNodeId && isEditing) {
+            // Store a copy for preview (must be independent of currentResult)
+            activeShape = applyTransform(primitive, { x: 0, y: 0, z: 0 }); // Null transform to copy
+        }
+
+        // 2. Combine with previous result
+        if (!currentResult) {
+            currentResult = primitive;
+            currentIsTemp = true;
+        } else {
+            const opResult = applyBooleanOperator(currentResult, primitive, node.booleanOp);
+            if (opResult.error) throw new Error(opResult.error);
+
+            // Cleanup: only delete if currentResult was a temporary accumulation
+            // Don't delete if it came directly from the cache
+            if (currentIsTemp) currentResult.delete();
+            primitive.delete(); // Primitives from executeNode are always new objects
+
+            currentResult = opResult.shape;
+            currentIsTemp = true; // Results of boolean ops are selalu temporary until cached
+        }
+
+        // Cache the result of THIS step
+        if (shapeCache.has(node.id)) {
+            const old = shapeCache.get(node.id);
+            if (old.shape !== currentResult) old.shape.delete();
+            if (old.maker && old.maker !== shapeData.maker) old.maker.delete();
+        }
+        shapeCache.set(node.id, {
+            shape: currentResult,
+            maker: shapeData.maker // Store the maker to keep the shape valid
+        });
+        currentIsTemp = false; // Now it's owned by the cache
+    }
+
+    // 3. Extract results
+    if (!currentResult) return { error: 'No shapes generated' };
+
+    const finalMeshData = getMeshData(currentResult);
+    let activeMeshData = null;
+
+    if (activeShape) {
+        activeMeshData = getMeshData(activeShape);
+        activeShape.delete(); // Cleanup preview copy
+    }
+
+    return {
+        mesh: {
+            positions: finalMeshData.positions,
+            normals: finalMeshData.normals
+        },
+        activeMesh: activeMeshData ? {
+            positions: activeMeshData.positions,
+            normals: activeMeshData.normals
+        } : null
+    };
+}
+
+/**
+ * Executes a single geometry node (Primitives).
+ */
+async function executeNode(node) {
+    const { operation, params } = node;
+    let result;
+
+    switch (operation) {
+        case 'MAKE_BOX':
+            result = makeBox(params, true);
+            break;
+        case 'MAKE_CYLINDER':
+            result = makeCylinder(params, true);
+            break;
+        case 'MAKE_SPHERE':
+            result = makeSphere(params, true);
+            break;
+        case 'MAKE_CONE':
+            result = makeCone(params, true);
+            break;
+        default:
+            return { error: `Unsupported operation: ${operation}` };
+    }
+
+    if (result.error) return result;
+
+    // Apply transformation
+    const untransformedShape = result.shape;
+    const transformed = applyTransform(untransformedShape, params.transform || { x: 0, y: 0, z: 0 });
+
+    // Explicitly delete the intermediate untransformed shape
+    untransformedShape.delete();
+
+    // Result object needs to contain the final shape
+    return {
+        shape: transformed,
+        maker: result.maker
+    };
+}
+
+/**
+ * Applies a Boolean operator between a base shape and a tool shape.
+ */
+function applyBooleanOperator(baseShape, toolShape, operator) {
+    if (operator === 'NONE') return { shape: baseShape };
+
+    let boolOp;
+    try {
+        switch (operator) {
+            case 'FUSE':
+                boolOp = new occt.BRepAlgoAPI_Fuse_3(baseShape, toolShape);
+                break;
+            case 'CUT':
+                boolOp = new occt.BRepAlgoAPI_Cut_3(baseShape, toolShape);
+                break;
+            case 'COMMON':
+                boolOp = new occt.BRepAlgoAPI_Common_3(baseShape, toolShape);
+                break;
+            default:
+                return { error: `Unknown operator: ${operator}` };
+        }
+
+        boolOp.Build();
+        if (!boolOp.IsDone()) throw new Error(`Boolean ${operator} failed`);
+
+        return {
+            shape: boolOp.Shape(),
+            maker: boolOp
+        };
+    } catch (err) {
+        return { error: err.message };
+    }
+}
 
 /**
  * Executes a Boolean operation between two shapes.
