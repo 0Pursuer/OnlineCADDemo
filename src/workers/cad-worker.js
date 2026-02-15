@@ -110,6 +110,15 @@ self.onmessage = async (event) => {
             case 'MAKE_BOX':
                 result = makeBox(payload);
                 break;
+            case 'MAKE_CYLINDER':
+                result = makeCylinder(payload);
+                break;
+            case 'MAKE_SPHERE':
+                result = makeSphere(payload);
+                break;
+            case 'MAKE_CONE':
+                result = makeCone(payload);
+                break;
             default:
                 throw new Error(`Unknown action: ${action}`);
         }
@@ -231,6 +240,63 @@ function makeBox({ width, height, depth }) {
         };
     } catch (err) {
         console.error("CAD Worker: makeBox failed", err);
+        return { error: err.toString() };
+    }
+}
+
+function makeCylinder({ radius, height }) {
+    console.log(`CAD Worker: Creating cylinder with r=${radius}, h=${height}`);
+    try {
+        const Ctor = findAnywhere(occt, 'BRepPrimAPI_MakeCylinder_1') || findAnywhere(occt, 'BRepPrimAPI_MakeCylinder');
+        if (!Ctor) throw new Error("Could not find BRepPrimAPI_MakeCylinder constructor");
+
+        const mkCyl = new Ctor(radius, height);
+        const shape = mkCyl.Shape();
+        const meshData = getMeshData(shape);
+        shape.delete();
+        mkCyl.delete();
+
+        return { created: true, type: 'cylinder', dims: [radius, height], positions: meshData.positions, normals: meshData.normals };
+    } catch (err) {
+        console.error("CAD Worker: makeCylinder failed", err);
+        return { error: err.toString() };
+    }
+}
+
+function makeSphere({ radius }) {
+    console.log(`CAD Worker: Creating sphere with r=${radius}`);
+    try {
+        const Ctor = findAnywhere(occt, 'BRepPrimAPI_MakeSphere_1') || findAnywhere(occt, 'BRepPrimAPI_MakeSphere');
+        if (!Ctor) throw new Error("Could not find BRepPrimAPI_MakeSphere constructor");
+
+        const mkSphere = new Ctor(radius);
+        const shape = mkSphere.Shape();
+        const meshData = getMeshData(shape);
+        shape.delete();
+        mkSphere.delete();
+
+        return { created: true, type: 'sphere', dims: [radius], positions: meshData.positions, normals: meshData.normals };
+    } catch (err) {
+        console.error("CAD Worker: makeSphere failed", err);
+        return { error: err.toString() };
+    }
+}
+
+function makeCone({ radius1, radius2, height }) {
+    console.log(`CAD Worker: Creating cone with r1=${radius1}, r2=${radius2}, h=${height}`);
+    try {
+        const Ctor = findAnywhere(occt, 'BRepPrimAPI_MakeCone_1') || findAnywhere(occt, 'BRepPrimAPI_MakeCone');
+        if (!Ctor) throw new Error("Could not find BRepPrimAPI_MakeCone constructor");
+
+        const mkCone = new Ctor(radius1, radius2, height);
+        const shape = mkCone.Shape();
+        const meshData = getMeshData(shape);
+        shape.delete();
+        mkCone.delete();
+
+        return { created: true, type: 'cone', dims: [radius1, radius2, height], positions: meshData.positions, normals: meshData.normals };
+    } catch (err) {
+        console.error("CAD Worker: makeCone failed", err);
         return { error: err.toString() };
     }
 }

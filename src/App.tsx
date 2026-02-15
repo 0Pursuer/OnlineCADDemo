@@ -5,8 +5,24 @@ import CADViewer from './components/CADViewer';
 function App() {
     const [status, setStatus] = useState('Initializing...');
     const [geometry, setGeometry] = useState<any>(null);
-    const [params, setParams] = useState({ width: 10, height: 10, depth: 10 });
+    const [shapeType, setShapeType] = useState<string>('box');
+    const [params, setParams] = useState<any>({ width: 10, height: 10, depth: 10 });
     const [isGenerating, setIsGenerating] = useState(false);
+
+    // Debounce Logic
+    const [debouncedParams, setDebouncedParams] = useState(params);
+    useEffect(() => {
+        const handler = setTimeout(() => {
+            setDebouncedParams(params);
+        }, 200); // 200ms debounce
+        return () => clearTimeout(handler);
+    }, [params]);
+
+    useEffect(() => {
+        if (status === 'Ready' || status === 'OCCT Worker Ready') {
+            handleCreateShape();
+        }
+    }, [debouncedParams, shapeType]);
 
     useEffect(() => {
         const init = async () => {
@@ -15,8 +31,7 @@ function App() {
                 await workerManager.waitForReady();
                 await workerManager.execute('PING');
                 setStatus('OCCT Worker Ready');
-                // Create initial box
-                handleCreateBox(10, 10, 10);
+                // Initial generation triggered by useEffect above
             } catch (err) {
                 setStatus('Error: ' + err);
             }
@@ -24,11 +39,19 @@ function App() {
         init();
     }, []);
 
-    const handleCreateBox = async (w: number, h: number, d: number) => {
+    const handleCreateShape = async () => {
         setIsGenerating(true);
         setStatus('Generating Geometry...');
         try {
-            const result = await workerManager.execute('MAKE_BOX', { width: w, height: h, depth: d });
+            let action = 'MAKE_BOX';
+            switch (shapeType) {
+                case 'box': action = 'MAKE_BOX'; break;
+                case 'cylinder': action = 'MAKE_CYLINDER'; break;
+                case 'sphere': action = 'MAKE_SPHERE'; break;
+                case 'cone': action = 'MAKE_CONE'; break;
+            }
+
+            const result = await workerManager.execute(action, debouncedParams);
             if (result.error) {
                 setStatus('Error: ' + result.error);
             } else {
@@ -43,10 +66,56 @@ function App() {
     };
 
     const updateParam = (name: string, value: string) => {
-        const num = parseFloat(value) || 1;
-        const newParams = { ...params, [name]: num };
+        const num = parseFloat(value) || 0.1;
+        setParams((prev: any) => ({ ...prev, [name]: num }));
+    };
+
+    const handleShapeChange = (newShape: string) => {
+        setShapeType(newShape);
+        // Set default params for new shape
+        let newParams = {};
+        switch (newShape) {
+            case 'box': newParams = { width: 10, height: 10, depth: 10 }; break;
+            case 'cylinder': newParams = { radius: 5, height: 10 }; break;
+            case 'sphere': newParams = { radius: 10 }; break;
+            case 'cone': newParams = { radius1: 5, radius2: 0, height: 10 }; break;
+        }
         setParams(newParams);
-        handleCreateBox(newParams.width, newParams.height, newParams.depth);
+        setDebouncedParams(newParams); // Sync immediately to avoid generation with stale params
+    };
+
+    const renderInputs = () => {
+        let currentParams: string[] = [];
+        switch (shapeType) {
+            case 'box': currentParams = ['width', 'height', 'depth']; break;
+            case 'cylinder': currentParams = ['radius', 'height']; break;
+            case 'sphere': currentParams = ['radius']; break;
+            case 'cone': currentParams = ['radius1', 'radius2', 'height']; break;
+        }
+
+        return currentParams.map((dim) => (
+            <div key={dim} className="space-y-2">
+                <div className="flex justify-between items-center text-sm">
+                    <label className="capitalize font-medium text-neutral-300">{dim}</label>
+                    <span className="text-blue-400 tabular-nums">{params[dim]} mm</span>
+                </div>
+                <input
+                    type="range"
+                    min="1"
+                    max="50"
+                    step="0.5"
+                    value={params[dim] || 0}
+                    onChange={(e) => updateParam(dim, e.target.value)}
+                    className="w-full accent-blue-600 h-1.5 bg-neutral-700 rounded-lg appearance-none cursor-pointer"
+                />
+                <input
+                    type="number"
+                    value={params[dim] || 0}
+                    onChange={(e) => updateParam(dim, e.target.value)}
+                    className="w-full bg-neutral-900 border border-white/5 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500 transition-colors"
+                />
+            </div>
+        ));
     };
 
     return (
@@ -59,8 +128,8 @@ function App() {
                 </div>
                 <div className="flex items-center gap-4">
                     <span className={`px-3 py-1 rounded-full text-xs font-medium border ${status === 'Ready' ? 'bg-green-500/10 text-green-400 border-green-500/20' :
-                            status.includes('Error') ? 'bg-red-500/10 text-red-400 border-red-500/20' :
-                                'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                        status.includes('Error') ? 'bg-red-500/10 text-red-400 border-red-500/20' :
+                            'bg-blue-500/10 text-blue-400 border-blue-500/20'
                         }`}>
                         {status}
                     </span>
@@ -74,32 +143,20 @@ function App() {
                 {/* Sidebar */}
                 <aside className="w-80 border-r border-white/10 bg-neutral-800/50 flex flex-col p-6 space-y-8">
                     <section>
-                        <h2 className="text-sm font-medium text-neutral-400 uppercase tracking-widest mb-6">Primitive: Box</h2>
+                        <h2 className="text-sm font-medium text-neutral-400 uppercase tracking-widest mb-6">Primitive Type</h2>
+                        <select
+                            value={shapeType}
+                            onChange={(e) => handleShapeChange(e.target.value)}
+                            className="w-full bg-neutral-900 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-6"
+                        >
+                            <option value="box">Box</option>
+                            <option value="cylinder">Cylinder</option>
+                            <option value="sphere">Sphere</option>
+                            <option value="cone">Cone</option>
+                        </select>
 
                         <div className="space-y-6">
-                            {(['width', 'height', 'depth'] as const).map((dim) => (
-                                <div key={dim} className="space-y-2">
-                                    <div className="flex justify-between items-center text-sm">
-                                        <label className="capitalize font-medium text-neutral-300">{dim}</label>
-                                        <span className="text-blue-400 tabular-nums">{params[dim]} mm</span>
-                                    </div>
-                                    <input
-                                        type="range"
-                                        min="1"
-                                        max="50"
-                                        step="1"
-                                        value={params[dim]}
-                                        onChange={(e) => updateParam(dim, e.target.value)}
-                                        className="w-full accent-blue-600 h-1.5 bg-neutral-700 rounded-lg appearance-none cursor-pointer"
-                                    />
-                                    <input
-                                        type="number"
-                                        value={params[dim]}
-                                        onChange={(e) => updateParam(dim, e.target.value)}
-                                        className="w-full bg-neutral-900 border border-white/5 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500 transition-colors"
-                                    />
-                                </div>
-                            ))}
+                            {renderInputs()}
                         </div>
                     </section>
 
@@ -108,7 +165,7 @@ function App() {
                         <div className="bg-black/20 rounded-lg p-3 border border-white/5">
                             <div className="flex items-center gap-2 text-sm text-neutral-300">
                                 <span className="opacity-50">📦</span>
-                                <span>Box_001</span>
+                                <span className="capitalize">{shapeType}_001</span>
                             </div>
                         </div>
                     </section>
