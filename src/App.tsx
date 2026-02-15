@@ -327,15 +327,17 @@ function App() {
                                             key={node.id}
                                             onClick={() => setActiveNode(node.id)}
                                             onContextMenu={(e) => handleContextMenu(e, node.id)}
-                                            className={`group relative p-3 rounded-xl border transition-all cursor-pointer flex items-center gap-3 ${activeNodeId === node.id
-                                                ? 'bg-blue-600/10 border-blue-500/50 shadow-lg shadow-blue-500/5'
-                                                : 'bg-black/20 border-white/10 hover:border-white/25 hover:bg-white/5'
+                                            className={`group relative p-3 rounded-xl border transition-all cursor-pointer flex items-center gap-3 ${node.error
+                                                    ? 'bg-red-500/10 border-red-500/50 hover:bg-red-500/20'
+                                                    : activeNodeId === node.id
+                                                        ? 'bg-blue-600/10 border-blue-500/50 shadow-lg shadow-blue-500/5'
+                                                        : 'bg-black/20 border-white/10 hover:border-white/25 hover:bg-white/5'
                                                 }`}
                                         >
                                             <div className={`w-1.5 h-1.5 rounded-full ${index === 0 ? 'bg-green-500' : 'bg-neutral-700 group-hover:bg-neutral-500'} transition-colors`}></div>
                                             <div className="flex-1">
                                                 <div className="flex justify-between items-center text-[10px] mb-0.5">
-                                                    <span className={`font-black tracking-tight ${activeNodeId === node.id ? 'text-blue-400' : 'text-neutral-300'}`}>
+                                                    <span className={`font-black tracking-tight ${node.error ? 'text-red-400' : activeNodeId === node.id ? 'text-blue-400' : 'text-neutral-300'}`}>
                                                         {node.label}
                                                     </span>
                                                     <span className="text-[8px] font-bold px-1.5 py-0.5 bg-black/40 text-neutral-500 rounded uppercase tracking-tighter">
@@ -345,7 +347,12 @@ function App() {
                                                 {node.booleanOp !== 'NONE' && (
                                                     <div className="text-[8px] text-blue-500/60 font-black uppercase tracking-widest">{node.booleanOp}</div>
                                                 )}
-                                                {node.dirty && <div className="absolute top-2 right-2 flex gap-0.5">
+                                                {node.error && (
+                                                    <div className="text-[9px] text-red-500 mt-1 font-bold truncate max-w-[180px]" title={node.error}>
+                                                        ⚠️ {node.error}
+                                                    </div>
+                                                )}
+                                                {!node.error && node.dirty && <div className="absolute top-2 right-2 flex gap-0.5">
                                                     <div className="w-1 h-1 rounded-full bg-yellow-500 animate-pulse"></div>
                                                 </div>}
                                             </div>

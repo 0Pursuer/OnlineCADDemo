@@ -196,91 +196,125 @@ async function recomputeHistory({ history, activeNodeId, isEditing }) {
     let currentIsTemp = false; // Track if currentResult can be safely deleted
     let activeShape = null;
     let needsCascade = false;
+    const errors = {}; // Track errors per node
 
     // 2. Process stack
     for (let i = 0; i < history.length; i++) {
         const node = history[i];
         const isDirty = node.dirty || (activeNodeId && node.id === activeNodeId && isEditing);
 
-        // If THIS node or any PREVIOUS node is dirty, we can't use the cache for the accumulation
-        if (!isDirty && !needsCascade && shapeCache.has(node.id)) {
-            const cached = shapeCache.get(node.id);
-            currentResult = cached.shape;
-            currentIsTemp = false; // It's owned by the cache
-            console.log(`Using cache for node ${node.id}`);
+        try {
+            // If THIS node or any PREVIOUS node is dirty, we can't use the cache for the accumulation
+            if (!isDirty && !needsCascade && shapeCache.has(node.id)) {
+                const cached = shapeCache.get(node.id);
+                currentResult = cached.shape;
+                currentIsTemp = false; // It's owned by the cache
+                console.log(`Using cache for node ${node.id}`);
 
-            // If we are editing this node, we still need its raw shape for preview
-            if (node.id === activeNodeId && isEditing) {
-                const shapeData = await executeNode(node);
-                activeShape = shapeData.shape;
+                // If we are editing this node, we still need its raw shape for preview
+                if (node.id === activeNodeId && isEditing) {
+                    const shapeData = await executeNode(node);
+                    activeShape = shapeData.shape;
+                }
+                continue;
             }
-            continue;
+
+            // We are recomputing this step or cascading
+            needsCascade = true;
+            console.log(`Recomputing node ${node.id} (Dirty: ${isDirty})`);
+
+            // 1. Generate the primitive for THIS node
+            const shapeData = await executeNode(node);
+            if (shapeData.error) throw new Error(shapeData.error);
+            const primitive = shapeData.shape;
+
+            let nodeResult = null;
+
+            // Preview logic
+            if (node.id === activeNodeId && isEditing) {
+                // Store a copy for preview
+                activeShape = applyTransform(primitive, { x: 0, y: 0, z: 0 });
+            }
+
+            // 2. Combine with previous result
+            if (!currentResult) {
+                nodeResult = primitive;
+                currentIsTemp = true;
+            } else {
+                const opResult = applyBooleanOperator(currentResult, primitive, node.booleanOp);
+
+                if (opResult.error) {
+                    // Boolean failed! 
+                    // We consume the primitive (delete it) and KEEP the old currentResult
+                    primitive.delete();
+                    throw new Error(`Boolean Op Failed: ${opResult.error}`);
+                } else {
+                    // Success
+                    if (currentIsTemp) currentResult.delete();
+                    primitive.delete();
+                    nodeResult = opResult.shape;
+                    currentIsTemp = true;
+                }
+            }
+
+            // Update currentResult
+            if (nodeResult) {
+                currentResult = nodeResult;
+            } else {
+                // Should not happen unless Base node failed?
+                // If Base failed, currentResult remains null.
+            }
+
+            // Update cache
+            if (nodeResult) {
+                if (shapeCache.has(node.id)) {
+                    const old = shapeCache.get(node.id);
+                    if (old.shape !== currentResult) old.shape.delete();
+                    if (old.maker && old.maker !== shapeData.maker) old.maker.delete();
+                }
+                shapeCache.set(node.id, {
+                    shape: currentResult,
+                    maker: shapeData.maker
+                });
+                currentIsTemp = false; // Owned by cache
+            }
+
+        } catch (err) {
+            console.error(`Error processing node ${node.id}:`, err);
+            errors[node.id] = err.message || "Unknown error";
+
+            // If this was the Base node and it failed, we are in trouble.
+            // currentResult might be null.
+            // If intermediate node failed, currentResult is the result of Previous node.
+            // We just continue loop.
+
+            // Fix: cleanup the maker from executeNode if it exists
+            // (the primitive itself may already be deleted in the boolean error path)
+            try {
+                if (typeof shapeData !== 'undefined' && shapeData?.maker) {
+                    shapeData.maker.delete();
+                }
+            } catch (cleanupErr) { /* ignore cleanup errors */ }
         }
-
-        // We are recomputing this step or cascading
-        needsCascade = true;
-        console.log(`Recomputing node ${node.id} (Dirty: ${isDirty}, Cascade: ${needsCascade})`);
-
-        // 1. Generate the primitive for THIS node
-        const shapeData = await executeNode(node);
-        if (shapeData.error) throw new Error(shapeData.error);
-        const primitive = shapeData.shape;
-
-        if (node.id === activeNodeId && isEditing) {
-            // Store a copy for preview (must be independent of currentResult)
-            activeShape = applyTransform(primitive, { x: 0, y: 0, z: 0 }); // Null transform to copy
-        }
-
-        // 2. Combine with previous result
-        if (!currentResult) {
-            currentResult = primitive;
-            currentIsTemp = true;
-        } else {
-            const opResult = applyBooleanOperator(currentResult, primitive, node.booleanOp);
-            if (opResult.error) throw new Error(opResult.error);
-
-            // Cleanup: only delete if currentResult was a temporary accumulation
-            // Don't delete if it came directly from the cache
-            if (currentIsTemp) currentResult.delete();
-            primitive.delete(); // Primitives from executeNode are always new objects
-
-            currentResult = opResult.shape;
-            currentIsTemp = true; // Results of boolean ops are selalu temporary until cached
-        }
-
-        // Cache the result of THIS step
-        if (shapeCache.has(node.id)) {
-            const old = shapeCache.get(node.id);
-            if (old.shape !== currentResult) old.shape.delete();
-            if (old.maker && old.maker !== shapeData.maker) old.maker.delete();
-        }
-        shapeCache.set(node.id, {
-            shape: currentResult,
-            maker: shapeData.maker // Store the maker to keep the shape valid
-        });
-        currentIsTemp = false; // Now it's owned by the cache
     }
 
     // 3. Extract results
-    if (!currentResult) return { error: 'No shapes generated' };
+    let finalMesh = null;
+    let actMesh = null;
 
-    const finalMeshData = getMeshData(currentResult);
-    let activeMeshData = null;
+    if (currentResult) {
+        finalMesh = getMeshData(currentResult);
+    }
 
     if (activeShape) {
-        activeMeshData = getMeshData(activeShape);
-        activeShape.delete(); // Cleanup preview copy
+        actMesh = getMeshData(activeShape);
+        activeShape.delete();
     }
 
     return {
-        mesh: {
-            positions: finalMeshData.positions,
-            normals: finalMeshData.normals
-        },
-        activeMesh: activeMeshData ? {
-            positions: activeMeshData.positions,
-            normals: activeMeshData.normals
-        } : null
+        mesh: finalMesh,
+        activeMesh: actMesh,
+        errors: errors
     };
 }
 
@@ -451,8 +485,32 @@ function getMeshData(shape) {
     const positions = [];
     const normals = [];
 
-    const deflection = 0.5; // Adjust for desired mesh quality
-    new occt.BRepMesh_IncrementalMesh_2(shape, deflection, false, 0.5, false);
+    // 1. Calculate optimal deflection based on size (Dynamic LOD)
+    const bbox = new occt.Bnd_Box_1();
+    occt.BRepBndLib.Add(shape, bbox, false);
+
+    const xMin = bbox.CornerMin().X();
+    const yMin = bbox.CornerMin().Y();
+    const zMin = bbox.CornerMin().Z();
+    const xMax = bbox.CornerMax().X();
+    const yMax = bbox.CornerMax().Y();
+    const zMax = bbox.CornerMax().Z();
+
+    const dx = xMax - xMin;
+    const dy = yMax - yMin;
+    const dz = zMax - zMin;
+    const diagonal = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+    // Auto-deflection: 0.2% of size, clamped between 0.01 (min detail) and 0.5 (max coarse)
+    const linearDeflection = Math.max(0.01, Math.min(0.5, diagonal * 0.002));
+    const angularDeflection = 0.5; // ~28 degrees, good balance for most curves
+
+    // 2. Meshing
+    const meshAlgo = new occt.BRepMesh_IncrementalMesh_2(shape, linearDeflection, false, angularDeflection, false);
+    meshAlgo.delete(); // Fix: mesh algorithm object must be explicitly released
+
+    // Cleanup bounding box object
+    bbox.delete();
 
     const explorer = new occt.TopExp_Explorer_2(shape, occt.TopAbs_ShapeEnum.TopAbs_FACE, occt.TopAbs_ShapeEnum.TopAbs_SHAPE);
     let count = 0;
@@ -496,6 +554,7 @@ function getMeshData(shape) {
                 normal.delete();
                 p1.delete();
                 p2.delete();
+                p3.delete(); // Fix: p3 was previously leaked per triangle!
             }
         }
         loc.delete();

@@ -134,8 +134,17 @@ export const useHistoryStore = create<HistoryStore>()(
                             finalMesh: result.mesh,
                             activeMesh: result.activeMesh
                         };
-                        // Clear dirty flags ONLY for the nodes we just processed
+                        // Clear dirty flags
                         state.nodes.forEach(n => n.dirty = false);
+
+                        // Update error states
+                        state.nodes.forEach(n => {
+                            if (result.errors && result.errors[n.id]) {
+                                n.error = result.errors[n.id];
+                            } else {
+                                n.error = null;
+                            }
+                        });
                     });
                 }
             } catch (err) {
