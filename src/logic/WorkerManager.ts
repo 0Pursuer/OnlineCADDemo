@@ -1,7 +1,11 @@
 /**
  * WorkerManager
  * Handles communication with the CAD Web Worker via a Promise-based API.
+ * Supports granular status reporting for engine initialization stages.
  */
+
+type StatusListener = (status: string) => void;
+
 export class WorkerManager {
     private worker: Worker;
     private messageQueue: Map<string, { resolve: (value: any) => void, reject: (reason?: any) => void }>;
@@ -9,12 +13,13 @@ export class WorkerManager {
     private readyPromise: Promise<void>;
     private readyResolve!: () => void;
     private readyReject!: (reason: any) => void;
+    private statusListeners: StatusListener[] = [];
 
     constructor() {
-        // Initialize the worker.
-        // Vite's `?worker` suffix or `new URL(..., import.meta.url)` syntax is standard.
+        // Initialize the worker using standard Vite pattern
         this.worker = new Worker(new URL('../workers/cad-worker.js', import.meta.url), {
-            type: 'module'
+            type: 'module',
+            name: 'CAD_ENGINE_WORKER'
         });
 
         this.messageQueue = new Map();
@@ -26,10 +31,30 @@ export class WorkerManager {
         // Setup listener
         this.worker.onmessage = this.handleMessage.bind(this);
 
-        // Optional: Error listener
+        // Detailed Error listener
         this.worker.onerror = (err) => {
-            console.error("Worker Error:", err);
+            console.error("[WorkerManager] Worker Error Event:", err);
+            if (err instanceof ErrorEvent) {
+                console.error(`[WorkerManager] Detail: ${err.message} at ${err.filename}:${err.lineno}:${err.colno}`);
+                this.readyReject(new Error(`Worker script error: ${err.message}`));
+            } else {
+                this.readyReject(new Error('Worker failed to load (check console for details)'));
+            }
         };
+    }
+
+    /**
+     * Register a listener for engine status updates during initialization.
+     */
+    public onStatus(listener: StatusListener): () => void {
+        this.statusListeners.push(listener);
+        return () => {
+            this.statusListeners = this.statusListeners.filter(l => l !== listener);
+        };
+    }
+
+    private notifyStatus(status: string) {
+        this.statusListeners.forEach(l => l(status));
     }
 
     /**
@@ -40,13 +65,28 @@ export class WorkerManager {
 
         // Handle System Messages
         if (type === 'STATUS') {
-            if (payload === 'READY') {
-                this.isReady = true;
-                this.readyResolve();
-                console.log("WorkerManager: Worker is ready");
-            } else if (payload === 'ERROR') {
-                this.readyReject(new Error(error || 'Worker initialization failed'));
-                console.error("WorkerManager: Worker failed to initialize", error);
+            switch (payload) {
+                case 'LOADING_OCCT':
+                    this.notifyStatus('Loading OCCT Core...');
+                    console.log("[WorkerManager] Engine status: Loading OCCT Core");
+                    break;
+                case 'LOADING_REPLICAD':
+                    this.notifyStatus('Initializing RepliCAD...');
+                    console.log("[WorkerManager] Engine status: Initializing RepliCAD");
+                    break;
+                case 'READY':
+                    this.isReady = true;
+                    this.notifyStatus('Ready');
+                    this.readyResolve();
+                    console.log("[WorkerManager] ✓ Worker is ready");
+                    break;
+                case 'ERROR':
+                    this.notifyStatus('Error: ' + (error || 'Unknown'));
+                    this.readyReject(new Error(error || 'Worker initialization failed'));
+                    console.error("[WorkerManager] ✗ Worker failed:", error);
+                    break;
+                default:
+                    console.log("[WorkerManager] Unknown status:", payload);
             }
             return;
         }
@@ -67,9 +107,6 @@ export class WorkerManager {
 
     /**
      * Sends a command to the worker and awaits the result.
-     * @param action The action name (e.g., 'MAKE_BOX')
-     * @param payload The data to send
-     * @returns Promise resolving to the result
      */
     public execute(action: string, payload: any = {}): Promise<any> {
         return new Promise((resolve, reject) => {
@@ -82,8 +119,6 @@ export class WorkerManager {
                 action,
                 payload
             });
-
-            // Optional: Timeout logic could be added here
         });
     }
 
@@ -104,5 +139,5 @@ export class WorkerManager {
     }
 }
 
-// Export a singleton instance if preferred, or the class
+// Export a singleton instance
 export const workerManager = new WorkerManager();

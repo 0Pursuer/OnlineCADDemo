@@ -13,6 +13,7 @@
     "opencascade.js": "^2.0.0-beta",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "replicad": "^0.20.5",
     "three": "^0.160.0",
     "zustand": "^5.0.11"
   },

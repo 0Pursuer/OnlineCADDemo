@@ -30,6 +30,8 @@ function App() {
     const [status, setStatus] = useState('Initializing...');
     const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
     const [menuNodeId, setMenuNodeId] = useState<string | null>(null);
+    const [interactionMode, setInteractionMode] = useState<'view' | 'select-edge'>('view');
+    const [selectedEdgeIds, setSelectedEdgeIds] = useState<number[]>([]);
 
     const handleContextMenu = (e: React.MouseEvent, nodeId: string) => {
         e.preventDefault();
@@ -52,11 +54,16 @@ function App() {
         };
     }, []);
 
-    // Initial Initialization
+    // Initial Initialization with granular status feedback
     useEffect(() => {
+        // Subscribe to real-time engine status updates
+        const unsubscribe = workerManager.onStatus((engineStatus) => {
+            setStatus(engineStatus);
+        });
+
         const init = async () => {
             try {
-                setStatus('Loading OCCT Engine...');
+                setStatus('Connecting to Engine...');
                 await workerManager.waitForReady();
                 await workerManager.execute('PING');
                 setStatus('Ready');
@@ -73,10 +80,12 @@ function App() {
                     });
                 }
             } catch (err) {
-                setStatus('Error: ' + err);
+                setStatus('Error: ' + (err instanceof Error ? err.message : String(err)));
             }
         };
         init();
+
+        return () => unsubscribe();
     }, []);
 
     // Trigger Recompute when nodes change
@@ -133,11 +142,47 @@ function App() {
             case 'cylinder': newParams = { radius: 5, height: 10 }; break;
             case 'sphere': newParams = { radius: 10 }; break;
             case 'cone': newParams = { radius1: 5, radius2: 0, height: 10 }; break;
+            case 'fillet': newParams = { radius: 2, edgeIds: [] }; break;
+            case 'chamfer': newParams = { distance: 2, edgeIds: [] }; break;
         }
         updateNode(id, {
-            operation: `MAKE_${newType.toUpperCase()}` as OperationType,
+            operation: (newType === 'fillet' || newType === 'chamfer')
+                ? (newType.toUpperCase() as OperationType)
+                : (`MAKE_${newType.toUpperCase()}` as OperationType),
             params: newParams
         });
+    };
+
+    const handleEdgeClick = (edgeId: number) => {
+        if (interactionMode === 'select-edge') {
+            setSelectedEdgeIds(prev => {
+                if (prev.includes(edgeId)) return prev.filter(id => id !== edgeId);
+                return [...prev, edgeId];
+            });
+        }
+    };
+
+    const startFeatureCreation = (type: 'FILLET' | 'CHAMFER') => {
+        setInteractionMode('select-edge');
+        setSelectedEdgeIds([]);
+        // Create the node immediately in the store
+        addNode({
+            label: type === 'FILLET' ? 'Fillet' : 'Chamfer',
+            operation: type as OperationType,
+            params: type === 'FILLET' ? { radius: 2, edgeIds: [] } : { distance: 2, edgeIds: [] },
+            booleanOp: BooleanOperator.NONE,
+            visible: true,
+            enabled: true
+        });
+    };
+
+    const applySelection = () => {
+        if (activeNodeId) {
+            updateNode(activeNodeId, {
+                params: { ...activeNode?.params, edgeIds: selectedEdgeIds }
+            });
+        }
+        setInteractionMode('view');
     };
 
     const renderPropertyEditor = () => {
@@ -148,10 +193,13 @@ function App() {
             'box': ['width', 'height', 'depth'],
             'cylinder': ['radius', 'height'],
             'sphere': ['radius'],
-            'cone': ['radius1', 'radius2', 'height']
+            'cone': ['radius1', 'radius2', 'height'],
+            'fillet': ['radius'],
+            'chamfer': ['distance']
         };
         const paramsList = paramsMap[type] || [];
         const isPrimitive = ['box', 'cylinder', 'sphere', 'cone'].includes(type);
+        const isModifier = ['fillet', 'chamfer'].includes(type);
 
         return (
             <div className="flex flex-col h-full">
@@ -195,8 +243,32 @@ function App() {
                                     <option value="cylinder">Cylinder</option>
                                     <option value="sphere">Sphere</option>
                                     <option value="cone">Cone</option>
+                                    <option value="fillet">Fillet</option>
+                                    <option value="chamfer">Chamfer</option>
                                 </select>
                             </div>
+
+                            {isModifier && (
+                                <div className="space-y-4">
+                                    <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <span className="text-[10px] text-blue-400 font-black uppercase tracking-widest">Target Edges</span>
+                                            <button
+                                                onClick={() => {
+                                                    setInteractionMode('select-edge');
+                                                    setSelectedEdgeIds(activeNode.params.edgeIds || []);
+                                                }}
+                                                className="text-[9px] bg-blue-600 px-2 py-0.5 rounded text-white font-bold hover:bg-blue-500 transition-colors"
+                                            >
+                                                EDIT SELECTION
+                                            </button>
+                                        </div>
+                                        <div className="text-[10px] text-neutral-400">
+                                            {activeNode.params.edgeIds?.length || 0} edges selected
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
 
                             {/* Dimensions */}
                             <div className="space-y-4 pt-2">
@@ -305,11 +377,21 @@ function App() {
                                     <div className="w-8 h-8 rounded-lg bg-neutral-800 flex items-center justify-center text-xl group-hover:scale-110 transition-transform">+</div>
                                     <span className="text-[9px] font-black uppercase tracking-wider text-neutral-400 group-hover:text-blue-400">Add shape</span>
                                 </button>
-                                <div className="flex flex-col gap-2">
-                                    <div className="flex-1 bg-black/30 rounded-xl border border-white/5 p-3 flex flex-col justify-center items-center">
-                                        <span className="text-[14px] font-black text-white/40">{nodes.length}</span>
-                                        <span className="text-[8px] font-bold text-neutral-600 uppercase">Features</span>
-                                    </div>
+                                <div className="grid grid-rows-2 gap-2">
+                                    <button
+                                        onClick={() => startFeatureCreation('FILLET')}
+                                        className="group flex items-center justify-center rounded-xl bg-neutral-900 border border-white/5 hover:border-pink-500/50 hover:bg-pink-600/5 transition-all gap-3 py-2 px-3"
+                                    >
+                                        <span className="text-sm group-hover:scale-110 transition-transform">🔘</span>
+                                        <span className="text-[9px] font-black uppercase tracking-wider text-neutral-400 group-hover:text-pink-400">Fillet</span>
+                                    </button>
+                                    <button
+                                        onClick={() => startFeatureCreation('CHAMFER')}
+                                        className="group flex items-center justify-center rounded-xl bg-neutral-900 border border-white/5 hover:border-orange-500/50 hover:bg-orange-600/5 transition-all gap-3 py-2 px-3"
+                                    >
+                                        <span className="text-sm group-hover:scale-110 transition-transform">📐</span>
+                                        <span className="text-[9px] font-black uppercase tracking-wider text-neutral-400 group-hover:text-orange-400">Chamfer</span>
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -328,10 +410,10 @@ function App() {
                                             onClick={() => setActiveNode(node.id)}
                                             onContextMenu={(e) => handleContextMenu(e, node.id)}
                                             className={`group relative p-3 rounded-xl border transition-all cursor-pointer flex items-center gap-3 ${node.error
-                                                    ? 'bg-red-500/10 border-red-500/50 hover:bg-red-500/20'
-                                                    : activeNodeId === node.id
-                                                        ? 'bg-blue-600/10 border-blue-500/50 shadow-lg shadow-blue-500/5'
-                                                        : 'bg-black/20 border-white/10 hover:border-white/25 hover:bg-white/5'
+                                                ? 'bg-red-500/10 border-red-500/50 hover:bg-red-500/20'
+                                                : activeNodeId === node.id
+                                                    ? 'bg-blue-600/10 border-blue-500/50 shadow-lg shadow-blue-500/5'
+                                                    : 'bg-black/20 border-white/10 hover:border-white/25 hover:bg-white/5'
                                                 }`}
                                         >
                                             <div className={`w-1.5 h-1.5 rounded-full ${index === 0 ? 'bg-green-500' : 'bg-neutral-700 group-hover:bg-neutral-500'} transition-colors`}></div>
@@ -377,7 +459,38 @@ function App() {
                     {/* Perspective Guide */}
                     <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_40%,_#1a1c22_0%,_#000000_100%)] pointer-events-none"></div>
 
-                    <CADViewer geometry={viewResult} />
+                    <CADViewer
+                        geometry={viewResult}
+                        onEdgeClick={handleEdgeClick}
+                        selectedEdgeIds={interactionMode === 'select-edge' ? selectedEdgeIds : activeNode?.params.edgeIds}
+                    />
+
+                    {interactionMode === 'select-edge' && (
+                        <div className="absolute bottom-24 left-1/2 -translate-x-1/2 flex items-center gap-6 bg-blue-900/40 backdrop-blur-2xl px-6 py-4 rounded-3xl border border-blue-400/30 shadow-[0_0_50px_rgba(59,130,246,0.3)] animate-in slide-in-from-bottom-8">
+                            <div className="flex flex-col">
+                                <span className="text-[10px] font-black text-blue-300 uppercase tracking-widest">Selection Mode</span>
+                                <span className="text-xs font-bold text-white">{selectedEdgeIds.length} Edges Selected</span>
+                            </div>
+                            <div className="w-px h-8 bg-white/10"></div>
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={() => {
+                                        setInteractionMode('view');
+                                        setSelectedEdgeIds([]);
+                                    }}
+                                    className="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-xl text-[10px] font-black uppercase transition-all"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={applySelection}
+                                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl text-[10px] font-black uppercase transition-all shadow-lg"
+                                >
+                                    Apply Selection
+                                </button>
+                            </div>
+                        </div>
+                    )}
 
                     {/* HUD Overlay */}
                     <div className="absolute top-8 left-8 flex flex-col gap-6 pointer-events-none transition-all duration-700">

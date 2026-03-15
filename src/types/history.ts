@@ -35,8 +35,12 @@ export interface ShapeReference {
 export interface MeshData {
     positions: Float32Array | number[];
     normals: Float32Array | number[];
+    indices?: Uint32Array | number[];             // Triangle index buffer
     faceIds?: Float32Array | number[]; // Optional face IDs for picking
     faceCount?: number;
+    edgePositions?: Float32Array | number[]; // Pair of points for each line segment
+    edgeIds?: Float32Array | number[];      // Per-vertex edge ID
+    edgeCount?: number;
 }
 
 /**
